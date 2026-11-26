@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -181,6 +182,12 @@ void testClaim() {
     expect(claimed == 1, "a new window claims the matching title");
     const auto fallback = hyprsession::claimPending(saved, pending, {.appId = "kitty", .initialAppId = "kitty", .initialTitle = ""});
     expect(fallback == 0, "an empty title claims the first pending window of that class");
+
+    const std::vector<hyprsession::WindowRecord> discord{window("discord", "Discord", 9)};
+    const auto updater = hyprsession::claimPending(discord, {0}, {.appId = "discord", .initialAppId = "discord", .initialTitle = "Discord Updater"});
+    expect(!updater.has_value(), "a splash title does not take the real window's slot");
+    const auto client = hyprsession::claimPending(discord, {0}, {.appId = "discord", .initialAppId = "discord", .initialTitle = "Discord"});
+    expect(client == 0, "the real discord window still claims its slot");
 }
 
 void testResume() {
@@ -207,6 +214,39 @@ void testResume() {
     expect(editor && *editor == std::vector<std::string>{"cursor"}, "cursor is launched once by name");
     expect(!hyprsession::relaunchArgv("foot", "/", "").has_value(), "a terminal with no directory keeps its original command");
     expect(!hyprsession::relaunchArgv("kitty", "/tmp", "").has_value(), "other apps keep their original command");
+}
+
+void testFlattenedCommand() {
+    auto discord = window("discord", "Discord", 9, {"/bin/sh --enable-features=WaylandLinuxDrmSyncobj"});
+    const auto split = hyprsession::launchArgv(discord);
+    expect(split.size() == 2 && split[0] == "/bin/sh" && split[1] == "--enable-features=WaylandLinuxDrmSyncobj", "a flattened electron command line splits at the executable");
+
+    auto kept = window("kitty", "shell", 3, {"kitty", "--single-instance"});
+    const auto plain = hyprsession::launchArgv(kept);
+    expect(plain.size() == 2 && plain[0] == "kitty" && plain[1] == "--single-instance", "argv that is already split stays split");
+
+    auto unknown = window("not-a-real-program", "nope", 4, {"/no/such/binary --flag"});
+    const auto unchanged = hyprsession::launchArgv(unknown);
+    expect(unchanged.size() == 1 && unchanged[0] == "/no/such/binary --flag", "a missing program is not split into junk");
+
+    auto stale = window("sh", "shell", 5, {"/no/such/Discord --enable-features=WaylandLinuxDrmSyncobj"});
+    const auto fallback = hyprsession::launchArgv(stale);
+    expect(fallback.size() == 1 && fallback[0] == "sh", "a dead recorded binary falls back to the app name");
+
+    const auto dir = std::filesystem::temp_directory_path() / "hyprsession argv";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    const auto bin = dir / "My App";
+    {
+        std::ofstream out(bin);
+        out << "#!/bin/sh\n";
+    }
+    std::filesystem::permissions(bin, std::filesystem::perms::owner_all, ec);
+    auto spaced = window("app", "App", 6, {bin.string() + " --flag"});
+    const auto recovered = hyprsession::launchArgv(spaced);
+    expect(recovered.size() == 2 && recovered[0] == bin.string() && recovered[1] == "--flag", "a path with spaces stays the executable");
+    std::filesystem::remove_all(dir, ec);
 }
 
 void testStore() {
@@ -240,6 +280,7 @@ int main() {
     testLaunches();
     testClaim();
     testResume();
+    testFlattenedCommand();
     testStore();
     if (g_failures != 0) {
         std::cerr << g_failures << " failed\n";

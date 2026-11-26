@@ -286,6 +286,8 @@ SDispatchResult Session::restore() {
     m_pending.clear();
     m_presented.clear();
     m_launched = 0;
+    m_launchFailures = 0;
+    m_preserveSnapshot = false;
 
     const auto open = openWindows();
     std::vector<LiveWindow> live;
@@ -301,16 +303,13 @@ SDispatchResult Session::restore() {
             place(open[placement.live].window, placement.saved, false);
     }
 
-    for (const auto& monitor : m_snapshot.monitors)
-        applyMonitor(monitor, m_snapshot);
-    focusSaved();
-
     const auto launches = planLaunches(m_snapshot, placements, splitSkipList(configString("plugin:hyprsession:skip_class")));
     for (const auto& launch : launches) {
         const auto spawned = spawnRequest(launch);
         if (!spawned.ok) {
+            ++m_launchFailures;
             if (Log::logger)
-                Log::logger->log(Log::ERR, "hyprsession", "launch {}: {}", launch.appId, spawned.error);
+                Log::logger->log(Log::ERR, "hyprsession", "launch {}: {} (other apps still restore)", launch.appId, spawned.error);
             continue;
         }
         ++m_launched;
@@ -390,12 +389,18 @@ void Session::finishRestore() {
         if (const auto window = m_placed.at(index).lock())
             applyFullscreen(window, m_snapshot.windows[index]);
     }
+    for (const auto& monitor : m_snapshot.monitors)
+        applyMonitor(monitor, m_snapshot);
     focusSaved();
 
-    const int placed   = static_cast<int>(m_placed.size());
-    const int launched = m_launched;
-    m_restoreActive    = false;
-    m_suspendWrites    = false;
+    const int    placed      = static_cast<int>(m_placed.size());
+    const int    launched    = m_launched;
+    const int    failed      = m_launchFailures;
+    const bool   incomplete  = !m_pending.empty() || failed > 0;
+    const size_t savedCount  = m_snapshot.windows.size();
+    m_restoreActive          = false;
+    m_suspendWrites          = false;
+    m_launchFailures         = 0;
     m_pending.clear();
     m_placed.clear();
     m_presented.clear();
@@ -405,8 +410,20 @@ void Session::finishRestore() {
     if (g_pEventLoopManager)
         g_pEventLoopManager->scheduleRecalc();
 
-    flush();
-    notify("hyprsession placed " + std::to_string(placed) + " windows, launched " + std::to_string(launched) + " apps, rebuilt " + std::to_string(rebuilt) + " splits");
+    if (incomplete) {
+        m_preserveSnapshot = true;
+        m_preserveCount    = savedCount;
+        m_preserveUntil    = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+        if (Log::logger)
+            Log::logger->log(Log::ERR, "hyprsession", "restore incomplete, previous snapshot kept");
+    } else {
+        flush();
+    }
+
+    std::string message = "hyprsession placed " + std::to_string(placed) + " windows, launched " + std::to_string(launched) + " apps, rebuilt " + std::to_string(rebuilt) + " splits";
+    if (failed > 0)
+        message += ", " + std::to_string(failed) + " apps failed";
+    notify(message);
 }
 
 bool Session::flush() {
@@ -417,7 +434,17 @@ bool Session::flush() {
     if (path.empty())
         return false;
 
-    const auto payload = toJson(captureLayout());
+    const auto layout = captureLayout();
+    if (m_preserveSnapshot) {
+        const bool expired  = std::chrono::steady_clock::now() >= m_preserveUntil;
+        const bool caughtUp = layout.windows.size() >= m_preserveCount;
+        if (expired || caughtUp)
+            m_preserveSnapshot = false;
+        else
+            return false;
+    }
+
+    const auto payload = toJson(layout);
     if (payload == m_lastWritten)
         return true;
 

@@ -12,6 +12,7 @@
 #include <hyprland/src/managers/fullscreen/FullscreenTypes.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/state/workspace/PlacementController.hpp>
 #include <hyprland/src/state/workspace/Resolver.hpp>
 #include <hyprland/src/state/WorkspaceState.hpp>
 #include <hyprland/src/workspace/HLWorkspace.hpp>
@@ -102,24 +103,35 @@ PHLMONITOR monitorFor(const MonitorRecord& record) {
     return byDescription;
 }
 
+void moveWorkspaceTo(PHLWORKSPACE workspace, PHLMONITOR monitor) {
+    if (!workspace || !monitor)
+        return;
+    const auto owner = workspace->m_monitor.lock();
+    if (owner && owner.get() == monitor.get())
+        return;
+    // carryFocus would switch the destination monitor and drop its previous workspace.
+    if (const auto& placement = State::Workspace::placementController())
+        placement->moveWorkspaceToMonitor(workspace, monitor, true, false);
+}
+
 void showSpecial(PHLMONITOR monitor, const std::string& address, const Snapshot& snapshot) {
     if (!monitor)
         return;
 
-    auto current = monitor->m_activeSpecialWorkspace;
+    // Set, rather than toggle. A toggle closes a special that is already open,
+    // and close_special_on_empty then destroys it before its windows map.
     if (address.empty()) {
-        if (current)
-            logAction("hide special workspace", Config::Actions::toggleSpecial(current));
+        if (monitor->m_activeSpecialWorkspace)
+            monitor->setSpecialWorkspace(nullptr);
         return;
     }
-    if (current && current->addressableName() == address)
-        return;
-    if (current)
-        logAction("hide special workspace", Config::Actions::toggleSpecial(current));
 
     auto special = ensureWorkspace(address, monitor, snapshot);
-    if (special)
-        logAction("show special workspace", Config::Actions::toggleSpecial(special));
+    if (!special)
+        return;
+    moveWorkspaceTo(special, monitor);
+    if (monitor->m_activeSpecialWorkspace != special)
+        monitor->setSpecialWorkspace(special);
 }
 
 Layout::Tiled::CDwindleAlgorithm* dwindleFor(PHLWORKSPACE workspace) {
@@ -274,19 +286,38 @@ bool moveToSavedWorkspace(PHLWINDOW window, const WindowRecord& record, const Sn
     if (!window || record.workspace.empty())
         return false;
 
-    const auto moved = Config::Actions::moveToWorkspace(record.workspace, true, window);
-    if (moved)
-        return true;
-    logAction("move window", moved);
-
-    PHLMONITOR monitor = window->m_monitor.lock();
+    PHLMONITOR monitor;
+    if (const auto& monitors = State::monitorState()) {
+        for (const auto& candidate : monitors->monitors()) {
+            if (candidate && candidate->m_name == record.monitor) {
+                monitor = candidate;
+                break;
+            }
+        }
+    }
+    if (!monitor)
+        monitor = window->m_monitor.lock();
     if (!monitor && State::monitorState() && !State::monitorState()->monitors().empty())
         monitor = State::monitorState()->monitors().front();
 
     auto workspace = ensureWorkspace(record.workspace, monitor, snapshot);
     if (!workspace)
         return false;
-    window->moveToWorkspace(workspace);
+    moveWorkspaceTo(workspace, monitor);
+
+    const auto moved = Config::Actions::moveToWorkspace(workspace, true, window);
+    if (!moved) {
+        logAction("move window", moved);
+        return false;
+    }
+
+    if (workspace->type() == Workspace::eWorkspaceType::SPECIAL) {
+        auto owner = workspace->m_monitor.lock();
+        if (!owner)
+            owner = monitor;
+        if (owner && owner->m_activeSpecialWorkspace != workspace)
+            owner->setSpecialWorkspace(workspace);
+    }
     return true;
 }
 
@@ -443,15 +474,11 @@ bool applyMonitor(const MonitorRecord& record, const Snapshot& snapshot) {
 
     logAction("focus monitor", Config::Actions::focusMonitor(monitor));
     if (!record.activeWorkspace.empty()) {
-        const auto changed = Config::Actions::changeWorkspace(record.activeWorkspace);
-        logAction("change workspace", changed);
-        if (!workspaceByAddress(record.activeWorkspace))
-            ensureWorkspace(record.activeWorkspace, monitor, snapshot);
-        if (auto workspace = workspaceByAddress(record.activeWorkspace)) {
-            const auto owner = workspace->m_monitor.lock();
-            if (owner.get() != monitor.get())
-                logAction("move workspace to monitor", Config::Actions::moveToMonitor(workspace, monitor));
-            logAction("change workspace", Config::Actions::changeWorkspace(workspace));
+        auto workspace = ensureWorkspace(record.activeWorkspace, monitor, snapshot);
+        if (workspace) {
+            moveWorkspaceTo(workspace, monitor);
+            if (workspace->type() != Workspace::eWorkspaceType::SPECIAL)
+                logAction("change workspace", Config::Actions::changeWorkspace(workspace));
         }
     }
 

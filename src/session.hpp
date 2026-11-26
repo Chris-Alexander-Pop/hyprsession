@@ -55,6 +55,10 @@ class Session {
     std::vector<size_t>                    m_pending;
     std::unordered_set<size_t>             m_presented;
     int                                    m_launched = 0;
+    int                                    m_launchFailures = 0;
+    bool                                   m_preserveSnapshot = false;
+    size_t                                 m_preserveCount = 0;
+    std::chrono::steady_clock::time_point  m_preserveUntil{};
     std::vector<pid_t>                     m_children;
     std::vector<CHyprSignalListener>       m_listeners;
     SP<CEventLoopTimer>                    m_periodic;

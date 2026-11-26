@@ -3,6 +3,9 @@
 #include <nlohmann/json.hpp>
 
 #include <cctype>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -168,14 +171,109 @@ bool looksLikeFlatpakId(const std::string& appId) {
     return appId.find('.') != std::string::npos && appId.find('/') == std::string::npos && appId.find(' ') == std::string::npos;
 }
 
+namespace {
+
+bool isExecutableFile(const std::string& candidate) {
+    const bool hasSpace = candidate.find_first_of(" \t") != std::string::npos;
+    const bool hasSlash = candidate.find('/') != std::string::npos;
+    if (candidate.empty() || (hasSpace && !hasSlash))
+        return false;
+
+    auto regularExecutable = [](const std::string& path) {
+        struct stat info;
+        if (::stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode))
+            return false;
+        return ::access(path.c_str(), X_OK) == 0;
+    };
+
+    if (candidate.find('/') != std::string::npos)
+        return regularExecutable(candidate);
+
+    const char* path = std::getenv("PATH");
+    if (!path)
+        return false;
+
+    std::string directory;
+    for (const char* cursor = path;; ++cursor) {
+        if (*cursor != ':' && *cursor != '\0') {
+            directory.push_back(*cursor);
+            continue;
+        }
+        if (!directory.empty()) {
+            if (regularExecutable(directory + "/" + candidate))
+                return true;
+            directory.clear();
+        }
+        if (*cursor == '\0')
+            break;
+    }
+    return false;
+}
+
+// Electron overwrites the NUL separators in /proc/pid/cmdline with spaces, so the
+// saved argv is one string. The longest prefix that is a real executable is the program.
+std::vector<std::string> recoverFlattenedArgv(const std::string& line) {
+    std::string best;
+    size_t      bestEnd = 0;
+    std::string candidate;
+    auto        consider = [&](size_t end) {
+        if (!isExecutableFile(candidate))
+            return;
+        best    = candidate;
+        bestEnd = end;
+    };
+
+    for (size_t index = 0; index < line.size(); ++index) {
+        const char ch = line[index];
+        if (ch == ' ' || ch == '\t') {
+            consider(index);
+            candidate.push_back(ch);
+            continue;
+        }
+        candidate.push_back(ch);
+    }
+    consider(line.size());
+    if (best.empty())
+        return {line};
+
+    std::vector<std::string> argv{best};
+    std::string              token;
+    for (size_t index = bestEnd; index < line.size(); ++index) {
+        const char ch = line[index];
+        if (ch == ' ' || ch == '\t') {
+            if (!token.empty()) {
+                argv.push_back(std::move(token));
+                token.clear();
+            }
+            continue;
+        }
+        token.push_back(ch);
+    }
+    if (!token.empty())
+        argv.push_back(std::move(token));
+    return argv;
+}
+
+} // namespace
+
 std::vector<std::string> launchArgv(const WindowRecord& window) {
     if (window.argv.empty())
         return {};
 
+    auto argv = window.argv;
+    if (argv.size() == 1 && argv[0].find_first_of(" \t") != std::string::npos)
+        argv = recoverFlattenedArgv(argv[0]);
+
     const auto key = classKey(window.appId, window.initialAppId);
-    if (baseName(window.argv.front()) == "bwrap" && looksLikeFlatpakId(key))
+    if (!argv.empty() && baseName(argv.front()) == "bwrap" && looksLikeFlatpakId(key))
         return {"flatpak", "run", key};
-    return window.argv;
+
+    if (!argv.empty() && !isExecutableFile(argv.front())) {
+        const auto program = baseName(key);
+        if (!program.empty() && program.find('/') == std::string::npos && isExecutableFile(program))
+            return {program};
+    }
+    return argv;
 }
 
 namespace {
@@ -487,6 +585,9 @@ std::optional<size_t> claimPending(const std::vector<WindowRecord>& windows, con
             continue;
         const auto& saved = windows[index];
         if (classKey(saved.appId, saved.initialAppId) != liveKey)
+            continue;
+        // A splash with a different title (Discord Updater) must not consume the real window.
+        if (!saved.initialTitle.empty() && !live.initialTitle.empty() && saved.initialTitle != live.initialTitle)
             continue;
         if (!live.initialTitle.empty() && live.initialTitle == saved.initialTitle)
             return index;
